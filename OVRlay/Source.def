@@ -1,0 +1,6 @@
+LIBRARY
+EXPORTS
+	Initialize
+	GetLayers
+	GetLayers2
+	HasFocus

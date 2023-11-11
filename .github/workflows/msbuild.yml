@@ -1,0 +1,80 @@
+name: MSBuild
+
+on:
+  push:
+    branches:
+    - main
+    - release/*
+    tags:
+    - '[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    branches:
+    - main
+    - release/*
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH: OVRlay.sln
+
+jobs:
+  build:
+    runs-on: windows-latest
+    environment: build-and-sign
+
+    steps:
+    - name: Checkout project
+      uses: actions/checkout@v2
+    
+    - name: Checkout submodules
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: git submodule update --init
+
+    - name: Setup DevEnv
+      uses: seanmiddleditch/gha-setup-vsdevenv@v4
+
+    - name: Restore NuGet packages
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: nuget restore ${{env.SOLUTION_FILE_PATH}}
+
+    - name: Build
+      env:
+        PFX_PASSWORD: ${{ secrets.PFX_PASSWORD }}
+        PFX_NAME: "comodo"
+      working-directory: ${{env.GITHUB_WORKSPACE}}
+      run: |
+        # Need to build vdproj. We must invoke this tool from inside its own folder.
+        $DisableOutOfProcBuild=$(vswhere -latest -find  **\DisableOutOfProcBuild.exe)
+        Push-Location $(Split-Path $DisableOutOfProcBuild)
+        & $DisableOutOfProcBuild
+        Pop-Location
+        
+        devenv.com ${{env.SOLUTION_FILE_PATH}} /Build "Release|x86"
+        devenv.com ${{env.SOLUTION_FILE_PATH}} /Build "Release|x64"
+
+        md sdk
+        copy LICENSE sdk/
+        copy THIRD_PARTY sdk/
+
+        md sdk/bin
+        copy bin/x64/Release/OVRlay.dll sdk/bin
+        copy bin/Win32/Release/OVRlay-32.dll sdk/bin
+        copy bin/x64/Release/OVRlay.pdb sdk/bin
+        copy bin/Win32/Release/OVRlay-32.pdb sdk/bin
+        copy bin/x64/Release/ShellApp.exe sdk/bin
+
+        md sdk/include
+        copy OVRlay/OVRlay.h sdk/include
+
+        md sdk/lib
+        copy bin/Win32/Release/OVRlay-32.lib sdk/lib
+        copy bin/x64/Release/OVRlay.lib sdk/lib
+
+        md sdk/standalone
+        copy OVRlay/OVRlay.h sdk/standalone
+        copy OVRlay/OVRlay.cpp sdk/standalone
+
+    - name: Publish
+      uses: actions/upload-artifact@v2
+      with:
+        name: SDK
+        path: sdk

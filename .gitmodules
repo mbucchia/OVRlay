@@ -1,0 +1,21 @@
+[submodule "external/OpenXR-SDK"]
+	path = external/OpenXR-SDK
+	url = https://github.com/KhronosGroup/OpenXR-SDK.git
+[submodule "external/OpenXR-SDK-Source"]
+	path = external/OpenXR-SDK-Source
+	url = https://github.com/KhronosGroup/OpenXR-SDK-Source.git
+[submodule "external/OpenXR-MixedReality"]
+	path = external/OpenXR-MixedReality
+	url = https://github.com/mbucchia/OpenXR-MixedReality.git
+[submodule "external/OpenXR-CTS"]
+	path = external/OpenXR-CTS
+	url = https://github.com/KhronosGroup/OpenXR-CTS.git
+[submodule "external/Vulkan-SDK"]
+	path = external/Vulkan-SDK
+	url = https://github.com/mbucchia/Vulkan-SDK.git
+[submodule "external/LibOVR"]
+	path = external/LibOVR
+	url = https://github.com/mbucchia/LibOVR.git
+[submodule "external/fmt"]
+	path = external/fmt
+	url = https://github.com/fmtlib/fmt.git
