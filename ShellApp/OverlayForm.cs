@@ -17,7 +17,7 @@ namespace WindowsFormsApp
 {
     public unsafe partial class OverlayForm : Form
     {
-        private const string OverlaysMapName = "VirtualDesktop.OverlayState";
+        private const string OverlaysMapName = "OVRlay.OverlayState";
 
         [StructLayout(LayoutKind.Sequential)]
         private struct Vector3
@@ -139,25 +139,26 @@ namespace WindowsFormsApp
             state.isFrozen = freeze.Checked;
             state.isInteractable = allowInteractions.Checked;
             windowState[hwnd] = state;
+            bool isMonitor = importedWindows.SelectedIndex < numMonitors;
 
             switch (importedWindows.SelectedIndex)
             {
                 case 0:
-                    syncState(ref overlays->window0, hwnd, state, op);
+                    syncState(ref overlays->window0, hwnd, state, op, isMonitor);
                     break;
                 case 1:
-                    syncState(ref overlays->window1, hwnd, state, op);
+                    syncState(ref overlays->window1, hwnd, state, op, isMonitor);
                     break;
                 case 2:
-                    syncState(ref overlays->window2, hwnd, state, op);
+                    syncState(ref overlays->window2, hwnd, state, op, isMonitor);
                     break;
                 case 3:
-                    syncState(ref overlays->window3, hwnd, state, op);
+                    syncState(ref overlays->window3, hwnd, state, op, isMonitor);
                     break;
             }
         }
 
-        private void syncState(ref OverlayState overlay, IntPtr handle, WindowState state, Operation op)
+        private void syncState(ref OverlayState overlay, IntPtr handle, WindowState state, Operation op, bool isMonitor = false)
         {
             if (op == Operation.Remove)
             {
@@ -177,12 +178,15 @@ namespace WindowsFormsApp
                     overlay.scale = 1.0f;
                     overlay.isMinimized = false;
 
+                    overlay.isMonitor = isMonitor;
+
                     // Do this last to avoid tearing.
                     overlay.handle = (ulong)handle;
                 }
             }
         }
 
+        int numMonitors = 0;
         List<IntPtr> hwndForAvailableWindow = new List<IntPtr>();
         List<IntPtr> hwndForImportedWindow = new List<IntPtr>();
         private void refresh_Tick(object sender, EventArgs e)
@@ -192,6 +196,19 @@ namespace WindowsFormsApp
             int scrollOffset = availableWindows.TopIndex;
             availableWindows.Items.Clear();
             hwndForAvailableWindow.Clear();
+            User32.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr hMonitor, IntPtr hdc, IntPtr lprcClip, IntPtr lParam)
+            {
+                User32.MONITORINFOEX mi = new User32.MONITORINFOEX() { Size = Marshal.SizeOf(typeof(User32.MONITORINFOEX)) };
+                if (User32.GetMonitorInfo(hMonitor, ref mi))
+                {
+                    availableWindows.Items.Add(mi.DeviceName);
+                    hwndForAvailableWindow.Add(hMonitor);
+                }
+                return true;
+            }, IntPtr.Zero);
+            numMonitors = availableWindows.Items.Count;
+            availableWindows.Items.Add("---");
+            hwndForAvailableWindow.Add(IntPtr.Zero);
             User32.EnumWindows(delegate (IntPtr hwnd, IntPtr param)
             {
                 bool isVisible = User32.IsWindowVisible(hwnd);
@@ -232,7 +249,7 @@ namespace WindowsFormsApp
 
         private void availableWindows_SelectedIndexChanged(object sender, EventArgs e)
         {
-            import.Enabled = importedWindows.Items.Count < 4 && availableWindows.SelectedItem != null;
+            import.Enabled = importedWindows.Items.Count < 4 && availableWindows.SelectedItem != null && availableWindows.SelectedIndex != numMonitors;
         }
 
         private void import_Click(object sender, EventArgs e)
@@ -332,7 +349,35 @@ namespace WindowsFormsApp
             [DllImport("user32.dll")]
             public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
+
             public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+            [DllImport("user32.dll")]
+            public static extern bool EnumDisplayMonitors(IntPtr hDC, IntPtr lprcClip, EnumDisplayMonitorsProc enumProc, IntPtr lParam);
+
+            public delegate bool EnumDisplayMonitorsProc(IntPtr hMonitor, IntPtr hdc, IntPtr lprcClip, IntPtr lParam);
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct RECT
+            {
+                public int Left;
+                public int Top;
+                public int Right;
+                public int Bottom;
+            }
+
+            [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+            public struct MONITORINFOEX
+            {
+                public int Size;
+                public RECT Monitor;
+                public RECT WorkArea;
+                public uint Flags;
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                public string DeviceName;
+            }
+
+            [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+            public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
 
             [DllImport("user32.dll")]
             [return: MarshalAs(UnmanagedType.Bool)]

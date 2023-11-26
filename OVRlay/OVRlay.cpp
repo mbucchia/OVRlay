@@ -463,7 +463,8 @@ void main(uint2 pos : SV_DispatchThreadID)
     if (all(TransparentColor == float3(-1.f, -1.f, -1.f)) || all(in_texture[pos].rgb == TransparentColor)) {
         a = Alpha;
     }
-    out_texture[pos] = float4(in_texture[pos].rgb, a);
+    // Make sure to premultiply RGB by alpha.
+    out_texture[pos] = float4(in_texture[pos].rgb * a, a);
 }
     )_";
 
@@ -508,7 +509,34 @@ void main(uint2 pos : SV_DispatchThreadID)
 
     class OverlayManager {
       private:
+        // The threshold for considering a trigger event to be a click.
+        static constexpr float ClickThreshold = 0.75f;
+
+        // The distance in front of the camera when spawning a new overlay.
+        static constexpr float SpawningDistance = 1.f;
+
+        // The multiplier for Z-axis movements when pushing or pulling an overlay.
+        static constexpr float PushPullMultiplier = 0.25f;
+
+        // The furtherest distance an overlay can be sent back.
+        static constexpr float MaxDistance = 10.f;
+
+        // The multiplier for scale when resizing an overlay.
+        static constexpr float ScaleMultiplier = 1.f;
+
+        // The size of the quad layer representing a minimized overlay.
         static constexpr float MinimizedIconSize = 0.1f;
+
+        // The color of the cursor (RGBA).
+        static constexpr uint32_t CursorColor = 0xffffffff;
+        // The size of the quad layer for the cursor.
+        static constexpr float CursorSize = 0.01f;
+
+        // Threshold for the opacity under which an overlay is not drawn.
+        static constexpr float OpacityThreshold = 0.01f;
+
+        // The multiplier for mouse wheel events when scrolling inside a window.
+        static constexpr float WheelMultiplier = 0.5f;
 
         enum class WindowPlacement {
             WorldLocked = 0,
@@ -571,8 +599,7 @@ void main(uint2 pos : SV_DispatchThreadID)
 
       public:
         OverlayManager() {
-            *m_overlayStateFile.put() =
-                OpenFileMapping(FILE_MAP_READ | FILE_MAP_WRITE, false, L"VirtualDesktop.OverlayState");
+            *m_overlayStateFile.put() = OpenFileMapping(FILE_MAP_READ | FILE_MAP_WRITE, false, L"OVRlay.OverlayState");
             if (!m_overlayStateFile) {
                 Log("Failed to open memory-mapped file.\n");
                 return;
@@ -654,7 +681,8 @@ void main(uint2 pos : SV_DispatchThreadID)
 
                 SyncWindow(i);
 
-                if (window.swapchain) {
+                if (window.swapchain &&
+                    std::find(m_sortedWindows.cbegin(), m_sortedWindows.cend(), i) != m_sortedWindows.cend()) {
                     CHECK_OVRCMD(m_dispatchTable.ovr_CommitTextureSwapChain(m_ovrSession, window.swapchain));
                 }
             }
@@ -787,7 +815,16 @@ void main(uint2 pos : SV_DispatchThreadID)
                 CHECK_OVRCMD(m_dispatchTable.ovr_CreateTextureSwapChainDX(
                     m_ovrSession, m_submissionDevice.Get(), &swapchainDesc, &m_cursorSwapchain));
 
-                std::vector<uint32_t> cursorBitmap(swapchainDesc.Width * swapchainDesc.Height, 0xffffffff);
+                std::vector<uint32_t> cursorBitmap(swapchainDesc.Width * swapchainDesc.Height, 0);
+                const uint32_t distSquare = (swapchainDesc.Width / 2) * (swapchainDesc.Width / 2);
+                for (int32_t y = 0; y < swapchainDesc.Height; y++) {
+                    for (int32_t x = 0; x < swapchainDesc.Width; x++) {
+                        const int32_t xFromCenter = (x - (swapchainDesc.Width / 2));
+                        const int32_t yFromCenter = (y - (swapchainDesc.Width / 2));
+                        cursorBitmap[y * swapchainDesc.Height + x] =
+                            ((xFromCenter * xFromCenter + yFromCenter * yFromCenter) <= distSquare) ? CursorColor : 0;
+                    }
+                }
 
                 D3D11_TEXTURE2D_DESC textureDesc{};
                 textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -796,7 +833,7 @@ void main(uint2 pos : SV_DispatchThreadID)
                 textureDesc.ArraySize = textureDesc.MipLevels = textureDesc.SampleDesc.Count = 1;
                 textureDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
                 D3D11_SUBRESOURCE_DATA initialData{};
-                initialData.SysMemPitch = textureDesc.Width;
+                initialData.SysMemPitch = textureDesc.Width * sizeof(uint32_t);
                 initialData.pSysMem = cursorBitmap.data();
                 ComPtr<ID3D11Texture2D> stagingTexture;
                 CHECK_HRCMD(m_submissionDevice->CreateTexture2D(
@@ -810,7 +847,7 @@ void main(uint2 pos : SV_DispatchThreadID)
 
                 m_cursorQuad.Header.Type = ovrLayerType_Quad;
                 m_cursorQuad.ColorTexture = m_cursorSwapchain;
-                m_cursorQuad.QuadSize = {0.01f, 0.01f};
+                m_cursorQuad.QuadSize = {CursorSize, CursorSize};
                 m_cursorQuad.Viewport.Size = {swapchainDesc.Width, swapchainDesc.Height};
             }
         }
@@ -842,6 +879,11 @@ void main(uint2 pos : SV_DispatchThreadID)
                         CloseWindow(i);
                         continue;
                     }
+                }
+
+                // User made the window invisible.
+                if (window.opacity < OpacityThreshold) {
+                    continue;
                 }
 
                 // TODO: Cull windows completely out of the view.
@@ -955,68 +997,79 @@ void main(uint2 pos : SV_DispatchThreadID)
                                       const OVR::Posef* controllerPoses,
                                       const OVR::Posef& hitPose) {
             // Read the buttons state.
-            constexpr float ClickThreshold = 0.75f;
             ovrInputState input{};
             m_dispatchTable.ovr_GetInputState(m_ovrSession, ovrControllerType_Touch, &input);
+
+            const bool wasThumbstickPressed = m_isThumbstickPressed;
+            m_isThumbstickPressed = input.Buttons & (!side ? ovrButton_LThumb : ovrButton_RThumb);
+            const bool wasPrimaryPressed = m_isPrimaryPressed;
+            m_isPrimaryPressed =
+                input.Buttons & (!side ? ovrButton_Y : ovrButton_B) || input.IndexTrigger[side] > ClickThreshold;
+            const bool wasSecondaryPressed = m_isSecondaryPressed;
+            m_isSecondaryPressed = input.Buttons & (!side ? ovrButton_X : ovrButton_A);
+            const bool isGrabPressed = input.HandTrigger[side] > ClickThreshold;
+            const bool isOppositeGrabPressed = input.HandTrigger[side ^ 1] > ClickThreshold;
 
             const bool isDraggingWindow = m_isDraggingWindow;
             m_isDraggingWindow = false;
             const bool isResizingWindow = m_isResizingWindow;
             m_isResizingWindow = false;
 
-            if (!window.isFrozen) {
-                const bool wasThumbstickPressed = m_isThumbstickPressed;
-                m_isThumbstickPressed = input.Buttons & (!side ? ovrButton_LThumb : ovrButton_RThumb);
-                if (!window.isMinimized && input.HandTrigger[side] > ClickThreshold) {
-                    if (input.HandTrigger[side ^ 1] <= ClickThreshold) {
-                        if (m_isThumbstickPressed && !wasThumbstickPressed) {
-                            // Reorient the window to face the camera.
-                            geom::facingCamera(window.quad.QuadPoseCenter, headPose);
-                        } else {
-                            // One handed grab: drag the window.
-                            if (input.IndexTrigger[side] > ClickThreshold) {
-                                if (isDraggingWindow) {
-                                    // Move along the cursor (lateral + height).
-                                    OVR::Vector3f delta = hitPose.Translation - m_lastCursorPosition;
+            // Handle interactions with the overlay.
+            if (!window.isFrozen && isGrabPressed) {
+                if (m_isThumbstickPressed && !wasThumbstickPressed) {
+                    // Minimize/unminimize on thumbstick click.
+                    // Double thumbstick click can be used make the overlay face the camera.
+                    window.isMinimized = !window.isMinimized;
+                    if (!window.isMinimized) {
+                        geom::facingCamera(window.quad.QuadPoseCenter, headPose);
+                        geom::alignToGravity(window.quad.QuadPoseCenter);
+                    }
+                } else if (!window.isMinimized) {
+                    if (!isOppositeGrabPressed) {
+                        // One handed grab enables a subset of interactions...
+                        if (m_isPrimaryPressed) {
+                            // Drag the overlay when the trigger is held.
+                            if (isDraggingWindow) {
+                                // Move along the cursor (lateral + height).
+                                OVR::Vector3f delta = hitPose.Translation - m_lastCursorPosition;
 
-                                    // Move along the forward axis.
-                                    constexpr float Sensitivity = 0.25f;
-                                    const float lastDistance =
-                                        (m_lastHeadPose.Translation - m_lastControllerPoses[side].Translation).Length();
-                                    const float distance =
-                                        (headPose.Translation - controllerPoses[side].Translation).Length();
-                                    delta = delta + OVR::Posef(window.quad.QuadPoseCenter.Orientation, {})
-                                                        .Transform({0, 0, (lastDistance - distance) * Sensitivity});
+                                // Move along the forward axis.
+                                const float lastDistance =
+                                    (m_lastHeadPose.Translation - m_lastControllerPoses[side].Translation).Length();
+                                const float distance =
+                                    (headPose.Translation - controllerPoses[side].Translation).Length();
+                                delta = delta + OVR::Posef(window.quad.QuadPoseCenter.Orientation, {})
+                                                    .Transform({0, 0, (lastDistance - distance) * PushPullMultiplier});
 
-                                    // Clamp to avoid too large motion.
-                                    // TODO: Need temporal component - frame rate isn't stable.
-                                    delta.x = std::clamp(delta.x, -0.02f, 0.02f);
-                                    delta.y = std::clamp(delta.y, -0.02f, 0.02f);
-                                    delta.z = std::clamp(delta.z, -0.01f, 0.01f);
-
-                                    const OVR::Vector3f newPosition =
-                                        OVR::Vector3f(window.quad.QuadPoseCenter.Position) + delta;
-
-                                    // Avoid sending a window too far from the camera.
-                                    constexpr float MaxDistance = 10.f;
-                                    if ((newPosition - headPose.Translation).Length() < MaxDistance) {
-                                        window.quad.QuadPoseCenter.Position = newPosition;
-                                    }
-                                }
-                                m_isDraggingWindow = true;
-                            } else {
-                                const ovrVector2f& thumbstick = input.Thumbstick[side];
-                                float yaw, pitch, roll;
-                                OVR::Quatf(window.quad.QuadPoseCenter.Orientation).GetYawPitchRoll(&yaw, &pitch, &roll);
+                                // Clamp to avoid too large motion.
                                 // TODO: Need temporal component - frame rate isn't stable.
-                                yaw += thumbstick.x * (float)MATH_DOUBLE_TWOPI / 360;
-                                pitch += -thumbstick.y * (float)MATH_DOUBLE_TWOPI / 360;
-                                window.quad.QuadPoseCenter.Orientation = geom::RotationRollPitchYaw({pitch, yaw, 0});
+                                delta.x = std::clamp(delta.x, -0.02f, 0.02f);
+                                delta.y = std::clamp(delta.y, -0.02f, 0.02f);
+                                delta.z = std::clamp(delta.z, -0.01f, 0.01f);
+
+                                const OVR::Vector3f newPosition =
+                                    OVR::Vector3f(window.quad.QuadPoseCenter.Position) + delta;
+
+                                // Avoid sending a window too far from the camera.
+                                if ((newPosition - headPose.Translation).Length() < MaxDistance) {
+                                    window.quad.QuadPoseCenter.Position = newPosition;
+                                }
                             }
+                            m_isDraggingWindow = true;
+                        } else {
+                            // Reorient the window with the joystick.
+                            const ovrVector2f& thumbstick = input.Thumbstick[side];
+                            float yaw, pitch, roll;
+                            OVR::Quatf(window.quad.QuadPoseCenter.Orientation).GetYawPitchRoll(&yaw, &pitch, &roll);
+                            // TODO: Need temporal component - frame rate isn't stable.
+                            yaw += thumbstick.x * (float)MATH_DOUBLE_TWOPI / 360;
+                            pitch += -thumbstick.y * (float)MATH_DOUBLE_TWOPI / 360;
+                            window.quad.QuadPoseCenter.Orientation = geom::RotationRollPitchYaw({pitch, yaw, 0});
                         }
                         geom::alignToGravity(window.quad.QuadPoseCenter);
                     } else {
-                        // Two handed grab: resize.
+                        // Two handed grab is used to resize the overlay.
                         if (isResizingWindow) {
                             const float lastLength =
                                 (m_lastControllerPoses[0].Translation - m_lastControllerPoses[1].Translation).Length();
@@ -1024,25 +1077,17 @@ void main(uint2 pos : SV_DispatchThreadID)
                                 (controllerPoses[0].Translation - controllerPoses[1].Translation).Length();
                             const float delta = currentLength - lastLength;
 
-                            window.scale += delta;
+                            window.scale += delta * ScaleMultiplier;
                         }
                         m_isResizingWindow = true;
                     }
-
-                    // No further interactions to be handled this frame.
-                    return;
-                } else if (m_isThumbstickPressed && !wasThumbstickPressed) {
-                    window.isMinimized = !window.isMinimized;
-                    if (!window.isMinimized) {
-                        geom::facingCamera(window.quad.QuadPoseCenter, headPose);
-                        geom::alignToGravity(window.quad.QuadPoseCenter);
-                    }
-
-                    // No further interactions to be handled this frame.
-                    return;
                 }
+
+                // No further interactions to be handled this frame.
+                return;
             }
 
+            // Handle mouse interactions inside the window.
             const bool isInteractable = !window.isMinimized && window.isInteractable;
             if (isInteractable) {
                 // Relocate our hit to be relative to the top-left corner of the window.
@@ -1053,46 +1098,74 @@ void main(uint2 pos : SV_DispatchThreadID)
                 // Check the window boundaries (remember: we offered a little margin when rendering the cursor).
                 if (cursorPosition.x > 0 && cursorPosition.x < sizeInPixels.w && cursorPosition.y > 0 &&
                     cursorPosition.y < sizeInPixels.h) {
-                    if (window.hasFocus) {
+                    const auto setCursorPos = [&]() {
                         // Update the cursor position.
                         // TODO: Why are coordinates off!?
                         POINT clickPosition = cursorPosition;
-                        ClientToScreen(window.hwnd, &clickPosition);
+                        if (window.hwnd) {
+                            ClientToScreen(window.hwnd, &clickPosition);
+                        } else {
+                            MONITORINFO info{sizeof(MONITORINFO)};
+                            GetMonitorInfo(window.monitor, &info);
+                            clickPosition.x += info.rcMonitor.left;
+                            clickPosition.y += info.rcMonitor.top;
+                        }
                         SetCursorPos(clickPosition.x, clickPosition.y);
+                    };
+
+                    // Continuously update cursor position once an overlay has focus.
+                    if (window.hasFocus) {
+                        setCursorPos();
                     }
 
-                    const bool wasTriggerPressed = m_isTriggerPressed;
-                    m_isTriggerPressed = input.IndexTrigger[side] > ClickThreshold;
-
-                    if (m_isTriggerPressed && !wasTriggerPressed) {
-                        const HWND oldForegroundWindow = GetForegroundWindow();
-                        POINT oldCursorPos{};
-                        GetCursorPos(&oldCursorPos);
-
+                    // Simulate mouse button presses.
+                    const bool newDownEvent = (m_isPrimaryPressed && !wasPrimaryPressed) ||
+                                              (m_isSecondaryPressed && !wasSecondaryPressed) ||
+                                              (m_isThumbstickPressed && !wasThumbstickPressed);
+                    if (newDownEvent) {
                         // Make sure the window can receive clicks.
-                        SetForegroundWindow(window.hwnd);
+                        if (window.hwnd) {
+                            SetForegroundWindow(window.hwnd);
+                        }
                         if (!window.hasFocus) {
                             // Move the cursor to the destination window.
-                            POINT clickPosition = cursorPosition;
-                            ClientToScreen(window.hwnd, &clickPosition);
-                            SetCursorPos(clickPosition.x, clickPosition.y);
+                            setCursorPos();
                         }
                         window.hasFocus = true;
 
-                        // Simulate a left click.
-                        INPUT events[2]{};
-                        events[0].type = INPUT_MOUSE;
-                        events[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                        events[1].type = INPUT_MOUSE;
-                        events[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                        SendInput(2, events, sizeof(INPUT));
-
-                        // TODO: Move the cursor and focus back.
-                        // SetCursorPos(oldCursorPos.x, oldCursorPos.y);
-                        // SetForegroundWindow(oldForegroundWindow);
+                        INPUT event{};
+                        event.type = INPUT_MOUSE;
+                        event.mi.dwFlags = m_isPrimaryPressed     ? MOUSEEVENTF_LEFTDOWN
+                                           : m_isSecondaryPressed ? MOUSEEVENTF_RIGHTDOWN
+                                                                  : MOUSEEVENTF_MIDDLEDOWN;
+                        SendInput(1, &event, sizeof(INPUT));
 
                         // No further interactions to be handled this frame.
                         return;
+                    }
+
+                    const bool newUpEvent = (!m_isPrimaryPressed && wasPrimaryPressed) ||
+                                            (!m_isSecondaryPressed && wasSecondaryPressed) ||
+                                            (!m_isThumbstickPressed && wasThumbstickPressed);
+                    if (newUpEvent) {
+                        INPUT event{};
+                        event.type = INPUT_MOUSE;
+                        event.mi.dwFlags = wasPrimaryPressed     ? MOUSEEVENTF_LEFTUP
+                                           : wasSecondaryPressed ? MOUSEEVENTF_RIGHTUP
+                                                                 : MOUSEEVENTF_MIDDLEUP;
+                        SendInput(1, &event, sizeof(INPUT));
+
+                        // No further interactions to be handled this frame.
+                        return;
+                    }
+
+                    // Simulate wheel.
+                    if (std::abs(input.Thumbstick[side].y) > 0.f) {
+                        INPUT event{};
+                        event.type = INPUT_MOUSE;
+                        event.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                        event.mi.mouseData = (DWORD)(input.Thumbstick[side].y * WHEEL_DELTA * WheelMultiplier);
+                        SendInput(1, &event, sizeof(INPUT));
                     }
                 }
             }
@@ -1100,10 +1173,8 @@ void main(uint2 pos : SV_DispatchThreadID)
 
         // Refresh the content of all windows.
         void UpdateWindows() {
-            for (auto& window : m_windows) {
-                if (!window.IsValid()) {
-                    continue;
-                }
+            for (auto& windowIndex : m_sortedWindows) {
+                auto& window = m_windows[windowIndex];
 
                 ID3D11Texture2D* windowSurface = window.captureWindow->getSurface();
                 if (!windowSurface) {
@@ -1165,18 +1236,23 @@ void main(uint2 pos : SV_DispatchThreadID)
                     window.swapchainSize.h = windowSurfaceDesc.Height;
                 }
 
-                RECT rc{};
-                CHECK_HRCMD(DwmGetWindowAttribute(window.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rc, sizeof(rc)));
                 D3D11_BOX box{};
-                box.right = rc.right - rc.left;
-                box.bottom = rc.bottom - rc.top;
                 box.back = 1;
+                if (window.hwnd) {
+                    RECT rc{};
+                    CHECK_HRCMD(DwmGetWindowAttribute(window.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rc, sizeof(rc)));
+                    box.right = rc.right - rc.left;
+                    box.bottom = rc.bottom - rc.top;
+                } else {
+                    box.right = windowSurfaceDesc.Width;
+                    box.bottom = windowSurfaceDesc.Height;
+                }
 
                 int imageIndex = 0;
                 CHECK_OVRCMD(
                     m_dispatchTable.ovr_GetTextureSwapChainCurrentIndex(m_ovrSession, window.swapchain, &imageIndex));
                 ID3D11Texture2D* swapchainImage = window.swapchainImagesOnCompositionDevice[imageIndex].Get();
-                if (window.opacity >= 0.9999f) {
+                if (window.opacity >= 1.f - OpacityThreshold) {
                     // Copy without transparency.
                     m_compositionContext->CopySubresourceRegion(swapchainImage, 0, 0, 0, 0, windowSurface, 0, &box);
                 } else {
@@ -1194,7 +1270,7 @@ void main(uint2 pos : SV_DispatchThreadID)
                     {
                         D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
                         desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-                        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        desc.Format = windowSurfaceDesc.Format;
                         desc.Texture2D.MipSlice = 0;
                         CHECK_HRCMD(m_compositionDevice->CreateUnorderedAccessView(
                             swapchainImage, &desc, uav.ReleaseAndGetAddressOf()));
@@ -1301,7 +1377,7 @@ void main(uint2 pos : SV_DispatchThreadID)
 
             // If the window is new, we spawn it in front of the user.
             if (OVR::Posef(window.quad.QuadPoseCenter).IsNan()) {
-                OVR::Posef front = OVR::Posef::Pose(OVR::Quatf::Identity(), {0.f, 0.f, -1.f});
+                OVR::Posef front = OVR::Posef::Pose(OVR::Quatf::Identity(), {0.f, 0.f, -SpawningDistance});
 
                 switch (window.placement) {
                 case WindowPlacement::WorldLocked:
@@ -1383,7 +1459,8 @@ void main(uint2 pos : SV_DispatchThreadID)
         uint32_t m_windowHovered{};
 
         bool m_isMenuPressed{false};
-        bool m_isTriggerPressed{false};
+        bool m_isPrimaryPressed{false};
+        bool m_isSecondaryPressed{false};
         bool m_isThumbstickPressed{false};
         bool m_isDraggingWindow{false};
         bool m_isResizingWindow{false};
