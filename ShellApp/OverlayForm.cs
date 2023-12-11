@@ -139,7 +139,15 @@ namespace WindowsFormsApp
             state.isFrozen = freeze.Checked;
             state.isInteractable = allowInteractions.Checked;
             windowState[hwnd] = state;
-            bool isMonitor = importedWindows.SelectedIndex < numMonitors;
+            bool isMonitor = false;
+            for (int i = 0; i < numMonitors; i++)
+            {
+                if (hwnd == hwndForAvailableWindow[i])
+                {
+                    isMonitor = true;
+                    break;
+                }
+            }
 
             switch (importedWindows.SelectedIndex)
             {

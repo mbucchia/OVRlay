@@ -556,7 +556,7 @@ void main(uint2 pos : SV_DispatchThreadID)
             }
 
             void Clear() {
-                quad.Header.Type = ovrLayerType_Disabled;
+                quad = {};
                 captureWindow.reset();
                 swapchainImagesOnSubmissionDevice.clear();
                 swapchainImagesOnCompositionDevice.clear();
@@ -690,7 +690,9 @@ void main(uint2 pos : SV_DispatchThreadID)
 
         void GetLayers(std::vector<const ovrLayerHeader*>& layers) {
             for (uint32_t index : m_sortedWindows) {
-                layers.push_back(&m_windows[index].quad.Header);
+                if (m_windows[index].quad.ColorTexture) {
+                    layers.push_back(&m_windows[index].quad.Header);
+                }
             }
 
             // Append the cursor.
